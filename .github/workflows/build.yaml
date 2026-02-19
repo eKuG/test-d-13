@@ -1,0 +1,118 @@
+name: Matrix Build (extract goreleaser.yaml)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            goos: linux
+            goarch: amd64
+            artifact_name: linux-amd64
+          - platform: linux/arm64
+            goos: linux
+            goarch: arm64
+            artifact_name: linux-arm64
+          - platform: darwin/arm64
+            goos: darwin
+            goarch: arm64
+            artifact_name: darwin-arm64
+          - platform: windows/amd64
+            goos: windows
+            goarch: amd64
+            artifact_name: windows-amd64
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run builder container (keep container)
+        id: run_builder
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          cname="otelbuilder-${{ matrix.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "container_name=$cname" >> "$GITHUB_OUTPUT"
+
+          # Clean any leftover container with same name (best effort)
+          docker rm -f "$cname" >/dev/null 2>&1 || true
+
+          # Run builder. IMPORTANT: no --rm so we can docker cp afterwards.
+          docker run --name "$cname" \
+            --workdir /github/workspace \
+            -e CI=true -e GITHUB_ACTIONS=true \
+            -v "/var/run/docker.sock:/var/run/docker.sock" \
+            -v "${{ github.workspace }}:/github/workspace" \
+            observiq/otel-distro-builder:v1 \
+            python /app/builder/src/main.py \
+              --manifest ./manifest.yaml \
+              --artifacts /github/workspace/artifacts \
+              --goos ${{ matrix.goos }} \
+              --goarch ${{ matrix.goarch }}
+
+      - name: Copy goreleaser.yaml + effective config out of container
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cname="${{ steps.run_builder.outputs.container_name }}"
+
+          mkdir -p extracted
+
+          echo "Copying .goreleaser.yaml from container..."
+          docker cp "$cname:/build/_build/.goreleaser.yaml" "extracted/.goreleaser-${{ matrix.artifact_name }}.yaml" || true
+
+          echo "Copying GoReleaser effective config (if present)..."
+          docker cp "$cname:/build/_build/dist/config.yaml" "extracted/goreleaser-effective-${{ matrix.artifact_name }}.yaml" || true
+
+          echo "List extracted files:"
+          ls -la extracted || true
+
+      - name: Print extracted goreleaser.yaml
+        if: always()
+        shell: bash
+        run: |
+          f="extracted/.goreleaser-${{ matrix.artifact_name }}.yaml"
+          if [[ -f "$f" ]]; then
+            echo "===== $f ====="
+            cat "$f"
+            echo "===== end ====="
+          else
+            echo "No goreleaser yaml extracted for ${{ matrix.artifact_name }} (copy likely failed)."
+          fi
+
+      - name: Upload extracted configs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goreleaser-config-${{ matrix.artifact_name }}
+          path: extracted/*
+          if-no-files-found: warn
+          retention-days: 5
+
+      - name: Upload build artifacts (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: distro-artifacts-${{ matrix.artifact_name }}
+          path: artifacts/*
+          if-no-files-found: ignore
+          retention-days: 5
+
+      - name: Cleanup builder container
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f "${{ steps.run_builder.outputs.container_name }}" >/dev/null 2>&1 || true
